@@ -1,3 +1,23 @@
 spring:
   application:
     name: hackgov
+  threads:
+    virtual:
+      enabled: true # retries sleep on the request thread; virtual threads make that cheap
+  mvc:
+    problemdetails:
+      enabled: true
+
+hackgov:
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY:}
+      # gpt-4o: fast, cheap, good enough for most plans.
+      # o3-mini: better at long dependency chains and date math; slower. Uses reasoning-effort, ignores temperature.
+      model: ${OPENAI_MODEL:gpt-4o}
+      reasoning-effort: medium
+      temperature: 0.2
+      # Covers reasoning tokens too on o-series models; raise to ~8000 for o3-mini on large plans.
+      max-completion-tokens: 4000
+      timeout: 60s
+      max-retries: 2

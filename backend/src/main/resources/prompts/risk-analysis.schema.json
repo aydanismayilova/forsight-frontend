@@ -1,0 +1,86 @@
+{
+  "name": "risk_analysis",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "risk_level",
+      "summary",
+      "bottleneck_task",
+      "impact_analysis",
+      "actionable_solution",
+      "win_rate_probability",
+      "assumptions"
+    ],
+    "properties": {
+      "risk_level": {
+        "type": "string",
+        "enum": ["Low", "Medium", "High", "Critical"]
+      },
+      "summary": {
+        "type": "string",
+        "description": "1-2 sentence conclusion for the chat UI, max 280 characters, no meta-introduction."
+      },
+      "bottleneck_task": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["task_id", "task_name", "root_cause", "slip_days"],
+        "properties": {
+          "task_id": { "type": "string", "description": "Exact task id from the input." },
+          "task_name": { "type": "string" },
+          "root_cause": { "type": "string", "description": "Operational cause, not just 'the task is late'." },
+          "slip_days": { "type": "integer", "description": "Projected delay of this task's end date, in days (>= 0)." }
+        }
+      },
+      "impact_analysis": {
+        "type": "array",
+        "description": "Downstream tasks whose projected end date moves, in dependency order.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["task_id", "task_name", "delay_days", "original_end", "projected_end", "on_critical_path"],
+          "properties": {
+            "task_id": { "type": "string" },
+            "task_name": { "type": "string" },
+            "delay_days": { "type": "integer" },
+            "original_end": { "type": "string", "description": "YYYY-MM-DD" },
+            "projected_end": { "type": "string", "description": "YYYY-MM-DD" },
+            "on_critical_path": { "type": "boolean" }
+          }
+        }
+      },
+      "actionable_solution": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "rationale", "steps", "owner", "effort", "days_recovered"],
+        "properties": {
+          "action": { "type": "string", "description": "Imperative, max 12 words." },
+          "rationale": { "type": "string", "description": "Which dependency this breaks and why it recovers time." },
+          "steps": {
+            "type": "array",
+            "description": "2-4 concrete steps that can start this week.",
+            "items": { "type": "string" }
+          },
+          "owner": { "type": "string" },
+          "effort": { "type": "string", "description": "e.g. '0.5 day setup'" },
+          "days_recovered": { "type": "integer" }
+        }
+      },
+      "win_rate_probability": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["before_mitigation", "after_mitigation"],
+        "properties": {
+          "before_mitigation": { "type": "integer", "description": "0-100, probability of delivering by the deadline." },
+          "after_mitigation": { "type": "integer", "description": "0-100, after applying actionable_solution." }
+        }
+      },
+      "assumptions": {
+        "type": "array",
+        "description": "At most 3 short assumptions made due to missing data.",
+        "items": { "type": "string" }
+      }
+    }
+  }
+}
