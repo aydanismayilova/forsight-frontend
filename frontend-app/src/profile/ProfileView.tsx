@@ -31,6 +31,8 @@ export interface ProfileViewProps {
   user: UserProfile;
   tasks: AssignedTask[];
   activity: ActivityEntry[];
+  /** Name, email and role come from the API and can't be edited here; only local preferences can. */
+  accountManaged?: boolean;
   onSave: (next: UserProfile) => void;
   onBack: () => void;
 }
@@ -50,6 +52,8 @@ const ACTIVITY_ICON: Record<ActivityKind, { icon: IconName; className: string }>
   account: { icon: "user", className: "bg-blue-50 text-indigo-700 ring-1 ring-inset ring-blue-200" },
 };
 
+const LOCKED = "cursor-not-allowed bg-slate-50 text-slate-500";
+
 const NOTIFICATION_LABELS: Record<keyof NotificationPrefs, { title: string; hint: string }> = {
   riskAlerts: { title: "Risk alerts", hint: "Push and email when a new bottleneck is forecast" },
   weeklyDigest: { title: "Weekly digest", hint: "Monday summary of forecasts and interventions" },
@@ -62,7 +66,7 @@ function formatJoined(iso: string): string {
 
 /* ───── Personal details ───── */
 
-function DetailsForm({ user, onSave }: { user: UserProfile; onSave: (next: UserProfile) => void }) {
+function DetailsForm({ user, managed, onSave }: { user: UserProfile; managed: boolean; onSave: (next: UserProfile) => void }) {
   const [draft, setDraft] = useState<UserProfile>(user);
   const [errors, setErrors] = useState<{ fullName?: string; email?: string }>({});
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -90,23 +94,23 @@ function DetailsForm({ user, onSave }: { user: UserProfile; onSave: (next: UserP
   return (
     <form onSubmit={submit} noValidate>
       <div className="grid gap-5 p-6 sm:grid-cols-2">
-        <Field id="pf-name" label="Full Name" error={errors.fullName}>
-          <input id="pf-name" value={draft.fullName} onChange={(e) => set("fullName", e.target.value)} autoComplete="name" className={inputClass(!!errors.fullName)} />
+        <Field id="pf-name" label="Full Name" error={errors.fullName} hint={managed ? "Managed by your Foresight account." : undefined}>
+          <input id="pf-name" value={draft.fullName} onChange={(e) => set("fullName", e.target.value)} autoComplete="name" disabled={managed} className={`${inputClass(!!errors.fullName)} ${managed ? LOCKED : ""}`} />
         </Field>
         <Field id="pf-email" label="Email" error={errors.email}>
-          <input id="pf-email" type="email" value={draft.email} onChange={(e) => set("email", e.target.value)} autoComplete="email" className={inputClass(!!errors.email)} />
+          <input id="pf-email" type="email" value={draft.email} onChange={(e) => set("email", e.target.value)} autoComplete="email" disabled={managed} className={`${inputClass(!!errors.email)} ${managed ? LOCKED : ""}`} />
         </Field>
-        <Field id="pf-title" label="Job Title">
+        <Field id="pf-title" label="Job Title" hint={managed ? "Saved in this browser only." : undefined}>
           <input id="pf-title" value={draft.jobTitle} onChange={(e) => set("jobTitle", e.target.value)} className={inputClass(false)} />
         </Field>
-        <Field id="pf-role" label="Role" hint="Controls what you can change in this workspace.">
-          <select id="pf-role" value={draft.role} onChange={(e) => set("role", e.target.value as AppRole)} className={inputClass(false)}>
+        <Field id="pf-role" label="Role" hint={managed ? "Derived from your workspace and project roles." : "Controls what you can change in this workspace."}>
+          <select id="pf-role" value={draft.role} onChange={(e) => set("role", e.target.value as AppRole)} disabled={managed} className={`${inputClass(false)} ${managed ? LOCKED : ""}`}>
             {ROLES.map((r) => (
               <option key={r}>{r}</option>
             ))}
           </select>
         </Field>
-        <Field id="pf-tz" label="Timezone">
+        <Field id="pf-tz" label="Timezone" hint={managed ? "Saved in this browser only." : undefined}>
           <select id="pf-tz" value={draft.timezone} onChange={(e) => set("timezone", e.target.value)} className={inputClass(false)}>
             {TIMEZONES.map((t) => (
               <option key={t}>{t}</option>
@@ -120,7 +124,7 @@ function DetailsForm({ user, onSave }: { user: UserProfile; onSave: (next: UserP
 
       <fieldset className="border-t border-slate-100 px-6 py-5">
         <legend className="sr-only">Notification preferences</legend>
-        <p className={EYEBROW}>Notification Preferences</p>
+        <p className={EYEBROW}>Notification Preferences{managed && " · saved in this browser"}</p>
         <ul className="mt-3 divide-y divide-slate-100 rounded-lg border border-slate-200">
           {(Object.keys(NOTIFICATION_LABELS) as (keyof NotificationPrefs)[]).map((key) => (
             <li key={key} className="flex items-center justify-between gap-4 px-4 py-3">
@@ -205,6 +209,14 @@ function TasksList({ tasks }: { tasks: AssignedTask[] }) {
 
 function ActivityLog({ entries }: { entries: ActivityEntry[] }) {
   const sorted = [...entries].sort((a, b) => b.at - a.at);
+  if (sorted.length === 0) {
+    return (
+      <div className="px-6 py-14 text-center">
+        <p className="text-sm font-medium text-slate-900">No activity yet</p>
+        <p className="mt-1 text-[13px] text-slate-500">Actions you take here are logged on this device.</p>
+      </div>
+    );
+  }
   return (
     <ol className="px-6 py-5">
       {sorted.map((e, i) => {
@@ -233,7 +245,7 @@ function ActivityLog({ entries }: { entries: ActivityEntry[] }) {
 
 /* ───── Page ───── */
 
-export function ProfileView({ user, tasks, activity, onSave, onBack }: ProfileViewProps) {
+export function ProfileView({ user, tasks, activity, accountManaged = false, onSave, onBack }: ProfileViewProps) {
   const [tab, setTab] = useState<Tab>("details");
   const atRisk = tasks.filter((t) => t.risk === "Critical" || t.risk === "High").length;
 
@@ -313,7 +325,7 @@ export function ProfileView({ user, tasks, activity, onSave, onBack }: ProfileVi
         </div>
 
         <div role="tabpanel">
-          {tab === "details" && <DetailsForm user={user} onSave={onSave} />}
+          {tab === "details" && <DetailsForm user={user} managed={accountManaged} onSave={onSave} />}
           {tab === "tasks" && <TasksList tasks={tasks} />}
           {tab === "activity" && <ActivityLog entries={activity} />}
         </div>

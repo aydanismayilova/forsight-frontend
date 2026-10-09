@@ -1,10 +1,14 @@
 /*
  * Client-side session model for Foresight.
  *
- * There is no auth backend yet: sign-in and registration are simulated in the
- * browser. Passwords are validated for shape and then discarded. Only the
- * profile object is ever persisted, never a password or token.
+ * Sign-in goes through the real backend (`/auth/*`). JWTs are kept by
+ * `api/tokens.ts`; this module persists only the display profile. The API has
+ * no endpoint for job title, timezone or notification preferences, so those
+ * are stored per user in this browser.
  */
+
+import { auth, workspaces, type AuthResponse, type ProjectRole, type UserView, type WorkspaceRole, type WorkspaceView } from "../api";
+import { clearTokens, loadTokens, saveTokens } from "../api/tokens";
 
 export type AppRole = "Project Lead" | "Admin" | "Developer" | "Member";
 
@@ -36,49 +40,13 @@ export interface UserProfile {
   notifications: NotificationPrefs;
 }
 
-export type DemoAccount = "lead" | "admin" | "developer";
-
-export const DEMO_ACCOUNTS: Record<DemoAccount, UserProfile> = {
-  lead: {
-    id: "u-anar",
-    fullName: "Anar Mammadov",
-    email: "anar@foresight.dev",
-    jobTitle: "Backend Lead",
-    role: "Project Lead",
-    timezone: TIMEZONES[0],
-    workspace: "Student Team Q4",
-    joinedAt: "2026-02-14",
-    notifications: { riskAlerts: true, weeklyDigest: true, mentions: true },
-  },
-  admin: {
-    id: "u-nigar",
-    fullName: "Nigar Huseynova",
-    email: "nigar@foresight.dev",
-    jobTitle: "Workspace Administrator",
-    role: "Admin",
-    timezone: TIMEZONES[0],
-    workspace: "Student Team Q4",
-    joinedAt: "2025-11-03",
-    notifications: { riskAlerts: true, weeklyDigest: false, mentions: true },
-  },
-  developer: {
-    id: "u-leyla",
-    fullName: "Leyla Aliyeva",
-    email: "leyla@foresight.dev",
-    jobTitle: "Frontend Developer",
-    role: "Developer",
-    timezone: TIMEZONES[0],
-    workspace: "Student Team Q4",
-    joinedAt: "2026-03-02",
-    notifications: { riskAlerts: true, weeklyDigest: true, mentions: false },
-  },
-};
-
-export const DEMO_ACCOUNT_LABEL: Record<DemoAccount, string> = {
-  lead: "Project Lead",
-  admin: "Admin",
-  developer: "Developer",
-};
+/** Accounts created by the backend's `demo` Spring profile. */
+export const DEMO_ACCOUNTS = [
+  { email: "ulvi@demo.foresight.local", name: "Ulvi" },
+  { email: "aydan@demo.foresight.local", name: "Aydan" },
+  { email: "huseyn@demo.foresight.local", name: "Huseyn" },
+] as const;
+export const DEMO_PASSWORD = "Password123";
 
 export function initialsOf(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -89,42 +57,94 @@ export function initialsOf(name: string): string {
 
 export const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export const MIN_PASSWORD = 8;
+export const MAX_PASSWORD = 128;
+/** Backend rule: 8-128 characters with at least one letter and one digit. */
+export const passwordProblem = (pw: string): string | null =>
+  pw.length < MIN_PASSWORD || pw.length > MAX_PASSWORD
+    ? `Use ${MIN_PASSWORD}-${MAX_PASSWORD} characters.`
+    : !/[A-Za-z]/.test(pw) || !/\d/.test(pw)
+      ? "Include at least one letter and one digit."
+      : null;
 
-/** Signs in a demo account by email, or builds a profile for any other address. */
-export function profileForEmail(email: string): UserProfile {
-  const normalized = email.trim().toLowerCase();
-  const demo = Object.values(DEMO_ACCOUNTS).find((u) => u.email === normalized);
-  if (demo) return { ...demo };
-  const local = normalized.split("@")[0].replace(/[._-]+/g, " ");
-  const fullName = local.replace(/\b\w/g, (c) => c.toUpperCase()) || "New User";
+/** Project role wins (it is what you do day to day), then the workspace role. */
+export function roleLabel(workspaceRole?: WorkspaceRole, projectRole?: ProjectRole): AppRole {
+  if (projectRole === "LEAD") return "Project Lead";
+  if (workspaceRole === "OWNER" || workspaceRole === "ADMIN") return "Admin";
+  if (projectRole === "CONTRIBUTOR") return "Developer";
+  return "Member";
+}
+
+/* ───── local-only preferences (no backend endpoint) ───── */
+
+type Prefs = Pick<UserProfile, "jobTitle" | "timezone" | "notifications">;
+
+const DEFAULT_PREFS: Prefs = {
+  jobTitle: "Team Member",
+  timezone: TIMEZONES[0],
+  notifications: { riskAlerts: true, weeklyDigest: true, mentions: true },
+};
+
+const prefsKey = (userId: string) => `foresight.prefs.${userId}`;
+
+export function loadPrefs(userId: string): Prefs {
+  try {
+    const raw = window.localStorage.getItem(prefsKey(userId));
+    if (raw) return { ...DEFAULT_PREFS, ...(JSON.parse(raw) as Partial<Prefs>) };
+  } catch {
+    /* unreadable: fall back to defaults */
+  }
+  return DEFAULT_PREFS;
+}
+
+export function savePrefs(user: UserProfile) {
+  try {
+    const prefs: Prefs = { jobTitle: user.jobTitle, timezone: user.timezone, notifications: user.notifications };
+    window.localStorage.setItem(prefsKey(user.id), JSON.stringify(prefs));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/* ───── sign-in against the API ───── */
+
+export function profileFromApi(user: UserView, workspace: WorkspaceView | null): UserProfile {
   return {
-    id: `u-${Date.now().toString(36)}`,
-    fullName,
-    email: normalized,
-    jobTitle: "Team Member",
-    role: "Member",
-    timezone: TIMEZONES[0],
-    workspace: "Student Team Q4",
-    joinedAt: new Date().toISOString().slice(0, 10),
-    notifications: { riskAlerts: true, weeklyDigest: true, mentions: true },
+    id: user.id,
+    fullName: user.fullName,
+    email: user.email,
+    role: roleLabel(workspace?.myRole),
+    workspace: workspace?.name ?? "No workspace yet",
+    joinedAt: user.createdAt.slice(0, 10),
+    ...loadPrefs(user.id),
   };
 }
 
-export function newAccount(input: { fullName: string; email: string; workspace: string }): UserProfile {
-  return {
-    id: `u-${Date.now().toString(36)}`,
-    fullName: input.fullName.trim(),
-    email: input.email.trim().toLowerCase(),
-    jobTitle: "Project Lead",
-    role: "Project Lead",
-    timezone: TIMEZONES[0],
-    workspace: input.workspace.trim(),
-    joinedAt: new Date().toISOString().slice(0, 10),
-    notifications: { riskAlerts: true, weeklyDigest: true, mentions: true },
-  };
+/** Stores the tokens from an auth response and builds the profile (first workspace wins). */
+export async function startSession(response: AuthResponse, remember: boolean): Promise<UserProfile> {
+  saveTokens({ accessToken: response.accessToken, refreshToken: response.refreshToken }, remember);
+  let workspace: WorkspaceView | null = null;
+  try {
+    workspace = (await workspaces.list()).content[0] ?? null;
+  } catch {
+    /* the profile is still usable without the workspace name */
+  }
+  return profileFromApi(response.user, workspace);
 }
 
-/* ───── persistence: "Remember me" → localStorage, otherwise this tab only ───── */
+export async function endSession() {
+  const tokens = loadTokens();
+  clearTokens();
+  clearSession();
+  if (tokens) {
+    try {
+      await auth.logout(tokens.refreshToken);
+    } catch {
+      /* already signed out locally; a failed revoke is not actionable */
+    }
+  }
+}
+
+/* ───── persistence of the display profile ───── */
 
 const SESSION_KEY = "foresight.session";
 
@@ -143,7 +163,9 @@ function storages(): Storage[] {
   return out;
 }
 
+/** The stored profile, only while tokens exist (profiles from the old simulated login are ignored). */
 export function loadSession(): UserProfile | null {
+  if (!loadTokens()) return null;
   for (const store of storages()) {
     try {
       const raw = store.getItem(SESSION_KEY);
@@ -185,7 +207,7 @@ export function clearSession() {
   }
 }
 
-/* ───── activity log ───── */
+/* ───── activity log (the API has no per-user activity feed; kept in this browser) ───── */
 
 export type ActivityKind = "ai" | "plan" | "account";
 
@@ -197,16 +219,26 @@ export interface ActivityEntry {
   detail?: string;
 }
 
-const H = 3_600_000;
+const ACTIVITY_LIMIT = 50;
+const activityKey = (userId: string) => `foresight.activity.${userId}`;
 
-export function seedActivity(now = Date.now()): ActivityEntry[] {
-  return [
-    { id: "a1", at: now - 2 * H, kind: "ai", text: "Acknowledged AI Mock API recommendation", detail: "Backend REST API Endpoints · Student Team Project Q4" },
-    { id: "a2", at: now - 5 * H, kind: "plan", text: "Ran a What-If scenario: deadline −2 days", detail: "On-time odds dropped to 9%" },
-    { id: "a3", at: now - 26 * H, kind: "ai", text: "Dismissed capacity warning for Elvin", detail: "QA load back under 85%" },
-    { id: "a4", at: now - 3 * 24 * H, kind: "plan", text: "Confirmed estimate: Backend REST API Endpoints", detail: "30h planned; AI forecasts 48h" },
-    { id: "a5", at: now - 6 * 24 * H, kind: "account", text: "Joined workspace Student Team Q4" },
-  ];
+export function loadActivity(userId: string | null): ActivityEntry[] {
+  if (!userId) return [];
+  try {
+    const raw = window.localStorage.getItem(activityKey(userId));
+    if (raw) return JSON.parse(raw) as ActivityEntry[];
+  } catch {
+    /* unreadable: start empty */
+  }
+  return [];
+}
+
+export function saveActivity(userId: string, entries: ActivityEntry[]) {
+  try {
+    window.localStorage.setItem(activityKey(userId), JSON.stringify(entries.slice(0, ACTIVITY_LIMIT)));
+  } catch {
+    /* storage unavailable */
+  }
 }
 
 export function timeAgo(ts: number, now = Date.now()): string {

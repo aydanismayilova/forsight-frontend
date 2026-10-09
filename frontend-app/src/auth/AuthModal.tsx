@@ -2,14 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Field, Icon, Logo } from "../ui";
 import { inputClass } from "../styles";
+import { ApiError, auth, errorMessage, workspaces } from "../api";
+import { saveTokens } from "../api/tokens";
 import {
   DEMO_ACCOUNTS,
-  DEMO_ACCOUNT_LABEL,
+  DEMO_PASSWORD,
   EMAIL_PATTERN,
   MIN_PASSWORD,
-  newAccount,
-  profileForEmail,
-  type DemoAccount,
+  passwordProblem,
+  profileFromApi,
+  startSession,
   type UserProfile,
 } from "./session";
 
@@ -23,9 +25,27 @@ export interface AuthModalProps {
   onAuthenticated: (user: UserProfile, remember: boolean, how: "signin" | "register" | "demo") => void;
 }
 
-type Errors = Partial<Record<"fullName" | "email" | "password" | "confirm" | "workspace", string>>;
+type Errors = Partial<Record<"fullName" | "email" | "password" | "confirm" | "workspace" | "form", string>>;
 
-const SIMULATED_LATENCY = 700;
+function FormError({ message }: { message?: string }) {
+  if (!message) return null;
+  return (
+    <p role="alert" className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-[13px] font-medium text-amber-950">
+      {message}
+    </p>
+  );
+}
+
+/** Maps a server rejection onto the form fields it belongs to. */
+function serverErrors(e: unknown): Errors {
+  if (e instanceof ApiError) {
+    if (e.code === "INVALID_CREDENTIALS" || e.code === "UNAUTHENTICATED") return { password: "Incorrect email or password." };
+    if (e.code === "EMAIL_TAKEN") return { email: "An account with this email already exists." };
+    const known = e.fieldErrors.filter((f) => f.field === "fullName" || f.field === "email" || f.field === "password");
+    if (known.length) return Object.fromEntries(known.map((f) => [f.field, f.message])) as Errors;
+  }
+  return { form: errorMessage(e) };
+}
 
 function PasswordInput({ id, value, onChange, error, autoComplete }: {
   id: string;
@@ -64,27 +84,38 @@ function SignInForm({ onAuthenticated, onSwitch }: { onAuthenticated: AuthModalP
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
   const [errors, setErrors] = useState<Errors>({});
-  const [busy, setBusy] = useState<"form" | DemoAccount | null>(null);
-  const timer = useRef<number | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const alive = useRef(true);
 
-  useEffect(() => () => {
-    if (timer.current !== null) window.clearTimeout(timer.current);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
   }, []);
+
+  const login = async (key: string, credentials: { email: string; password: string }, how: "signin" | "demo") => {
+    setBusy(key);
+    setErrors({});
+    try {
+      const response = await auth.login(credentials);
+      const profile = await startSession(response, remember);
+      onAuthenticated(profile, remember, how);
+    } catch (err) {
+      if (!alive.current) return;
+      setErrors(serverErrors(err));
+      setBusy(null);
+    }
+  };
 
   const submit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const next: Errors = {};
     if (!EMAIL_PATTERN.test(email.trim())) next.email = "Enter a valid email address.";
-    if (password.length < MIN_PASSWORD) next.password = `Password must be at least ${MIN_PASSWORD} characters.`;
+    if (!password) next.password = "Enter your password.";
     setErrors(next);
     if (Object.keys(next).length) return;
-    setBusy("form");
-    timer.current = window.setTimeout(() => onAuthenticated(profileForEmail(email), remember, "signin"), SIMULATED_LATENCY);
-  };
-
-  const demo = (account: DemoAccount) => {
-    setBusy(account);
-    timer.current = window.setTimeout(() => onAuthenticated({ ...DEMO_ACCOUNTS[account] }, remember, "demo"), SIMULATED_LATENCY / 2);
+    void login("form", { email: email.trim().toLowerCase(), password }, "signin");
   };
 
   return (
@@ -106,6 +137,8 @@ function SignInForm({ onAuthenticated, onSwitch }: { onAuthenticated: AuthModalP
       <Field id="signin-password" label="Password" error={errors.password}>
         <PasswordInput id="signin-password" value={password} onChange={setPassword} error={errors.password} autoComplete="current-password" />
       </Field>
+
+      <FormError message={errors.form} />
 
       <div className="flex items-center justify-between">
         <label className="flex cursor-pointer items-center gap-2 text-[13px] text-slate-700">
@@ -132,16 +165,16 @@ function SignInForm({ onAuthenticated, onSwitch }: { onAuthenticated: AuthModalP
       </div>
 
       <div className="grid grid-cols-3 gap-2">
-        {(Object.keys(DEMO_ACCOUNTS) as DemoAccount[]).map((key) => (
+        {DEMO_ACCOUNTS.map((account) => (
           <button
-            key={key}
+            key={account.email}
             type="button"
-            onClick={() => demo(key)}
+            onClick={() => void login(account.email, { email: account.email, password: DEMO_PASSWORD }, "demo")}
             disabled={busy !== null}
             className="flex flex-col items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-2.5 text-center transition-colors hover:border-amber-300 hover:bg-amber-50 disabled:opacity-60"
           >
-            <span className="text-[12px] font-semibold text-slate-900">{busy === key ? "Signing in…" : `as ${DEMO_ACCOUNT_LABEL[key]}`}</span>
-            <span className="truncate text-[11px] text-slate-500">{DEMO_ACCOUNTS[key].fullName.split(" ")[0]}</span>
+            <span className="text-[12px] font-semibold text-slate-900">{busy === account.email ? "Signing in…" : account.name}</span>
+            <span className="truncate text-[11px] text-slate-500">demo account</span>
           </button>
         ))}
       </div>
@@ -160,10 +193,13 @@ function RegisterForm({ onAuthenticated, onSwitch }: { onAuthenticated: AuthModa
   const [form, setForm] = useState({ fullName: "", email: "", password: "", confirm: "", workspace: "" });
   const [errors, setErrors] = useState<Errors>({});
   const [busy, setBusy] = useState(false);
-  const timer = useRef<number | null>(null);
+  const alive = useRef(true);
 
-  useEffect(() => () => {
-    if (timer.current !== null) window.clearTimeout(timer.current);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
   }, []);
 
   const set = (key: keyof typeof form) => (v: string) => setForm((f) => ({ ...f, [key]: v }));
@@ -173,16 +209,26 @@ function RegisterForm({ onAuthenticated, onSwitch }: { onAuthenticated: AuthModa
     const next: Errors = {};
     if (form.fullName.trim().length < 2) next.fullName = "Enter your full name.";
     if (!EMAIL_PATTERN.test(form.email.trim())) next.email = "Enter a valid email address.";
-    if (form.password.length < MIN_PASSWORD) next.password = `Use at least ${MIN_PASSWORD} characters.`;
+    const pwProblem = passwordProblem(form.password);
+    if (pwProblem) next.password = pwProblem;
     if (form.confirm !== form.password) next.confirm = "Passwords don't match.";
     if (form.workspace.trim().length < 2) next.workspace = "Name your workspace or team.";
     setErrors(next);
     if (Object.keys(next).length) return;
     setBusy(true);
-    timer.current = window.setTimeout(
-      () => onAuthenticated(newAccount({ fullName: form.fullName, email: form.email, workspace: form.workspace }), true, "register"),
-      SIMULATED_LATENCY,
-    );
+    void (async () => {
+      try {
+        const response = await auth.register({ fullName: form.fullName.trim(), email: form.email.trim().toLowerCase(), password: form.password });
+        saveTokens({ accessToken: response.accessToken, refreshToken: response.refreshToken }, true);
+        // The creator becomes the workspace OWNER. If this fails the account still exists; Settings can create one later.
+        const workspace = await workspaces.create(form.workspace.trim()).catch(() => null);
+        onAuthenticated(profileFromApi(response.user, workspace), true, "register");
+      } catch (err) {
+        if (!alive.current) return;
+        setErrors(serverErrors(err));
+        setBusy(false);
+      }
+    })();
   };
 
   const text = (key: "fullName" | "email" | "workspace", label: string, type: string, autoComplete: string, placeholder: string) => (
@@ -207,7 +253,7 @@ function RegisterForm({ onAuthenticated, onSwitch }: { onAuthenticated: AuthModa
       {text("fullName", "Full Name", "text", "name", "Anar Mammadov")}
       {text("email", "Email", "email", "email", "you@team.dev")}
       <div className="grid gap-4 sm:grid-cols-2">
-        <Field id="reg-password" label="Password" error={errors.password} hint={`${MIN_PASSWORD}+ characters`}>
+        <Field id="reg-password" label="Password" error={errors.password} hint={`${MIN_PASSWORD}+ characters, with a letter and a digit`}>
           <PasswordInput id="reg-password" value={form.password} onChange={set("password")} error={errors.password} autoComplete="new-password" />
         </Field>
         <Field id="reg-confirm" label="Confirm Password" error={errors.confirm}>
@@ -215,6 +261,8 @@ function RegisterForm({ onAuthenticated, onSwitch }: { onAuthenticated: AuthModa
         </Field>
       </div>
       {text("workspace", "Workspace / Team Name", "text", "organization", "Student Team Q4")}
+
+      <FormError message={errors.form} />
 
       <button
         type="submit"
@@ -305,7 +353,7 @@ export function AuthModal({ open, tab, onTabChange, onClose, onAuthenticated }: 
         </div>
 
         <p className="rounded-b-2xl border-t border-slate-100 bg-slate-50 px-6 py-3 text-center text-[11px] leading-relaxed text-slate-500">
-          Demo mode: accounts live only in this browser. Any email with an {MIN_PASSWORD}+ character password signs in; passwords are never stored.
+          Connected to the Foresight API. Demo accounts exist when the backend runs with the <code className="font-mono">demo</code> profile.
         </p>
       </div>
     </div>

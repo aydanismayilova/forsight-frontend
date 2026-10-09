@@ -6,15 +6,30 @@ import { AuthModal, type AuthTab } from "./auth/AuthModal";
 import { UserAvatar, UserMenu } from "./auth/UserMenu";
 import {
   clearSession,
+  endSession,
+  loadActivity,
   loadSession,
+  roleLabel,
+  saveActivity,
+  savePrefs,
   saveSession,
-  seedActivity,
   updateSession,
   type ActivityEntry,
   type ActivityKind,
   type UserProfile,
 } from "./auth/session";
 import { ProfileView, type AssignedTask, type RiskLevel } from "./profile/ProfileView";
+import { setAuthLostHandler } from "./api";
+import type { Severity } from "./api";
+import { useLive, type Live } from "./live/useLive";
+import { LiveRiskPanel } from "./live/LiveRiskPanel";
+import { TasksView } from "./live/TasksView";
+import { InboxView } from "./live/InboxView";
+import { WorkloadView } from "./live/WorkloadView";
+import { SettingsView } from "./live/SettingsView";
+import { CreateProjectModal } from "./live/ProjectParts";
+import { Empty, Loading, Notice } from "./live/common";
+import { OPEN_STATUSES, btnPrimary, fmtDate, humanize } from "./live/format";
 
 /* ═══════════════════════════════════════════════════════════════════════════
    Types
@@ -280,10 +295,17 @@ function Pill({ trend, children }: { trend: Trend; children: ReactNode }) {
    1. Top navigation
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function ProjectSwitcher({ activeId, onChange }: { activeId: string; onChange: (id: string) => void }) {
+function ProjectSwitcher({ projects, activeId, onChange, onCreate, loading }: {
+  projects: Project[];
+  activeId: string | null;
+  onChange: (id: string) => void;
+  /** Present only when signed in: opens the "new project" dialog. */
+  onCreate?: () => void;
+  loading?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  const active = PROJECTS.find((p) => p.id === activeId) ?? PROJECTS[0];
+  const active = projects.find((p) => p.id === activeId);
 
   useEffect(() => {
     if (!open) return;
@@ -308,12 +330,13 @@ function ProjectSwitcher({ activeId, onChange }: { activeId: string; onChange: (
       >
         <span className="hidden text-slate-400 sm:inline">Project</span>
         <span className="hidden h-4 w-px bg-slate-200 sm:inline" />
-        <span className="truncate font-semibold">{active.name}</span>
+        <span className={`truncate font-semibold ${active ? "" : "text-slate-400"}`}>{active ? active.name : loading ? "Loading projects…" : "No project yet"}</span>
         <Icon name="chevron" className={`h-4 w-4 text-slate-400 transition-transform ${open ? "rotate-180" : ""}`} />
       </button>
       {open && (
         <ul role="listbox" className="absolute left-0 z-30 mt-2 w-72 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-lg shadow-slate-900/5">
-          {PROJECTS.map((p) => (
+          {projects.length === 0 && <li className="px-3.5 py-2.5 text-[13px] text-slate-500">No projects in this workspace.</li>}
+          {projects.map((p) => (
             <li key={p.id} role="option" aria-selected={p.id === activeId}>
               <button
                 type="button"
@@ -329,16 +352,33 @@ function ProjectSwitcher({ activeId, onChange }: { activeId: string; onChange: (
               </button>
             </li>
           ))}
+          {onCreate && (
+            <li className="border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => {
+                  setOpen(false);
+                  onCreate();
+                }}
+                className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left text-sm font-semibold text-slate-900 hover:bg-slate-50"
+              >
+                <span aria-hidden="true">+</span> New project
+              </button>
+            </li>
+          )}
         </ul>
       )}
     </div>
   );
 }
 
-function TopNav({ projectId, onProjectChange, atRisk, onOpenCopilot, onOpenNav, userMenu }: {
+function TopNav({ projects, projectId, projectsLoading, onProjectChange, onCreateProject, atRisk, onOpenCopilot, onOpenNav, userMenu }: {
   userMenu: ReactNode;
-  projectId: string;
+  projects: Project[];
+  projectId: string | null;
+  projectsLoading: boolean;
   onProjectChange: (id: string) => void;
+  onCreateProject?: () => void;
   atRisk: boolean;
   onOpenCopilot: () => void;
   onOpenNav: () => void;
@@ -355,7 +395,7 @@ function TopNav({ projectId, onProjectChange, atRisk, onOpenCopilot, onOpenNav, 
           >
             <Icon name="menu" />
           </button>
-          <ProjectSwitcher activeId={projectId} onChange={onProjectChange} />
+          <ProjectSwitcher projects={projects} activeId={projectId} onChange={onProjectChange} onCreate={onCreateProject} loading={projectsLoading} />
         </div>
         <div className="flex shrink-0 items-center justify-end gap-2.5">
           <span className="hidden items-center gap-2 rounded-full bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white xl:inline-flex">
@@ -386,7 +426,7 @@ function TopNav({ projectId, onProjectChange, atRisk, onOpenCopilot, onOpenNav, 
    Sidebar
    ═══════════════════════════════════════════════════════════════════════════ */
 
-type NavId = "dashboard" | "cascade" | "simulator" | "inbox" | "workload" | "settings";
+type NavId = "dashboard" | "cascade" | "simulator" | "inbox" | "tasks" | "workload" | "settings";
 
 interface NavItem {
   id: NavId;
@@ -554,7 +594,7 @@ function Sidebar({ items, active, collapsed, mobileOpen, user, onAccount, onSele
   );
 }
 
-function PlaceholderView({ title, description, onBack }: { title: string; description: string; onBack: () => void }) {
+function PlaceholderView({ title, description, onBack, action }: { title: string; description: string; onBack: () => void; action?: { label: string; onClick: () => void } }) {
   return (
     <Card className="flex flex-col items-center px-6 py-16 text-center">
       <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
@@ -562,13 +602,24 @@ function PlaceholderView({ title, description, onBack }: { title: string; descri
       </span>
       <h2 className="mt-4 text-lg font-semibold tracking-tight text-slate-900">{title}</h2>
       <p className="mt-1 max-w-md text-sm text-slate-600">{description}</p>
-      <button
-        type="button"
-        onClick={onBack}
-        className="mt-6 inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
-      >
-        Back to Dashboard
-      </button>
+      <div className="mt-6 flex flex-wrap justify-center gap-2.5">
+        {action && (
+          <button type="button" onClick={action.onClick} className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800">
+            {action.label}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={onBack}
+          className={
+            action
+              ? "inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              : "inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+          }
+        >
+          Back to Dashboard
+        </button>
+      </div>
     </Card>
   );
 }
@@ -1439,7 +1490,7 @@ function CopilotDrawer({ open, onClose, mitigated, strategyBusy, onApplyMock, on
 const NEW_INBOX_ALERTS = 3;
 const SECTION_IDS = ["dashboard", "cascade", "simulator"] as const;
 type SectionId = (typeof SECTION_IDS)[number];
-type View = "dashboard" | "workload" | "settings" | "profile";
+type View = "dashboard" | "tasks" | "inbox" | "workload" | "settings" | "profile";
 
 /* ═══════════════════════════════════════════════════════════════════════════
    Assigned tasks for the profile page
@@ -1486,6 +1537,29 @@ function assignedTasksFor(user: UserProfile, f: Forecast, mitigated: boolean): A
   return [...live, ...(OTHER_PROJECT_TASKS[key] ?? [])];
 }
 
+const SEVERITY_RANK: Severity[] = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+const SEVERITY_LEVEL: Record<Severity, RiskLevel> = { CRITICAL: "Critical", HIGH: "High", MEDIUM: "Medium", LOW: "Low" };
+
+/** The user's open tasks in the selected project, each with the worst active risk on it. */
+function liveAssignedTasks(live: Live, userId: string): AssignedTask[] {
+  if (!live.project) return [];
+  return live.tasks
+    .filter((t) => t.assignee?.id === userId && OPEN_STATUSES.includes(t.status))
+    .map((t) => {
+      const mine = live.risks.filter((r) => r.taskId === t.id || r.affectedTaskIds.includes(t.id));
+      const worst = SEVERITY_RANK.find((sev) => mine.some((r) => r.severity === sev));
+      const top = worst ? mine.find((r) => r.severity === worst) : undefined;
+      return {
+        id: t.id,
+        task: t.title,
+        project: live.project!.name,
+        due: fmtDate(t.dueDate),
+        risk: worst ? SEVERITY_LEVEL[worst] : "Low",
+        note: top ? top.title : `${humanize(t.status)} · ${t.progressPercentage}% complete${t.overdue ? " · overdue" : ""}`,
+      };
+    });
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    Page
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -1503,7 +1577,11 @@ export default function PredictiveRiskManager() {
   const [inboxUnread, setInboxUnread] = useState(NEW_INBOX_ALERTS);
   const [user, setUser] = useState<UserProfile | null>(loadSession);
   const [auth, setAuth] = useState<{ open: boolean; tab: AuthTab }>({ open: false, tab: "signin" });
-  const [activity, setActivity] = useState<ActivityEntry[]>(() => seedActivity());
+  const [activity, setActivity] = useState<ActivityEntry[]>(() => loadActivity(loadSession()?.id ?? null));
+  const [notice, setNotice] = useState<string | null>(null);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const live = useLive(user !== null);
+  const activityRef = useRef(activity);
   const inputRef = useRef<HTMLInputElement>(null);
   const pendingScroll = useRef<SectionId | null>(null);
   const timer = useRef<number | null>(null);
@@ -1527,9 +1605,14 @@ export default function PredictiveRiskManager() {
 
   /* ───── activity log (only recorded for a signed-in user) ───── */
 
+  // The ref mirrors the state so several entries logged in one tick are all persisted.
   const logActivity = useCallback((kind: ActivityKind, text: string, detail?: string) => {
-    if (!userRef.current) return;
-    setActivity((a) => [{ id: `a-${Date.now().toString(36)}-${a.length}`, at: Date.now(), kind, text, detail }, ...a]);
+    const who = userRef.current;
+    if (!who) return;
+    const entry: ActivityEntry = { id: `a-${Date.now().toString(36)}-${activityRef.current.length}`, at: Date.now(), kind, text, detail };
+    activityRef.current = [entry, ...activityRef.current];
+    setActivity(activityRef.current);
+    saveActivity(who.id, activityRef.current);
   }, []);
 
   const applyMock = useCallback(() => {
@@ -1561,22 +1644,44 @@ export default function PredictiveRiskManager() {
   const onAuthenticated = (next: UserProfile, remember: boolean, how: "signin" | "register" | "demo") => {
     saveSession(next, remember);
     userRef.current = next;
+    activityRef.current = loadActivity(next.id);
+    setActivity(activityRef.current);
+    setNotice(null);
     setUser(next);
     setAuth((a) => ({ ...a, open: false }));
     if (how === "register") logActivity("account", `Created workspace ${next.workspace}`);
     else logActivity("account", how === "demo" ? `Signed in with demo account (${next.role})` : "Signed in", remember ? "Session remembered on this device" : undefined);
   };
 
-  const logOut = () => {
-    clearSession();
+  const signedOut = useCallback(() => {
+    userRef.current = null;
+    activityRef.current = [];
+    setActivity([]);
     setUser(null);
-    if (view === "profile") setView("dashboard");
+    setCopilotOpen(false);
+    setView("dashboard");
+  }, []);
+
+  const logOut = () => {
+    void endSession();
+    signedOut();
   };
+
+  // The API client calls this when the refresh token is rejected.
+  useEffect(() => {
+    setAuthLostHandler(() => {
+      clearSession();
+      signedOut();
+      setNotice("Your session has expired. Sign in again to keep working.");
+    });
+    return () => setAuthLostHandler(null);
+  }, [signedOut]);
 
   const saveProfile = (next: UserProfile) => {
     setUser(next);
     updateSession(next);
-    logActivity("account", "Updated personal details");
+    savePrefs(next);
+    logActivity("account", "Updated profile preferences");
   };
 
   /* ───── navigation ───── */
@@ -1611,8 +1716,11 @@ export default function PredictiveRiskManager() {
 
   const onNavigate = (id: NavId) => {
     setMobileNavOpen(false);
-    if (id === "inbox") openCopilot();
-    else if (id === "workload" || id === "settings") showView(id);
+    if (id === "inbox") {
+      // Signed in: the real inbox. Signed out: the demo Copilot, as before.
+      if (live.enabled) showView("inbox");
+      else openCopilot();
+    } else if (id === "tasks" || id === "workload" || id === "settings") showView(id);
     else goToSection(id);
   };
 
@@ -1666,12 +1774,24 @@ export default function PredictiveRiskManager() {
     { id: "dashboard", label: "Dashboard", icon: "dashboard" },
     { id: "cascade", label: "Risk Cascade", icon: "cascade" },
     { id: "simulator", label: "What-If Simulator", icon: "sliders" },
-    { id: "inbox", label: "AI Inbox", icon: "inbox", badge: inboxUnread || undefined },
+    { id: "inbox", label: "AI Inbox", icon: "inbox", badge: (live.enabled ? live.unread : inboxUnread) || undefined },
+    { id: "tasks", label: "Tasks", icon: "cascade" },
     { id: "workload", label: "Team Workload", icon: "users" },
     { id: "settings", label: "Settings", icon: "settings" },
   ];
   const activeView: View = view === "profile" && !user ? "dashboard" : view;
-  const activeNav: NavId | null = copilotOpen ? "inbox" : activeView === "dashboard" ? section : activeView === "profile" ? null : activeView;
+  const activeNav: NavId | null = copilotOpen && !live.enabled ? "inbox" : activeView === "dashboard" ? section : activeView === "profile" ? null : activeView;
+
+  /* ───── what the signed-in UI shows, derived from the API ───── */
+
+  const shownUser = useMemo<UserProfile | null>(
+    () => (user && live.workspace ? { ...user, workspace: live.workspace.name, role: roleLabel(live.workspace.myRole, live.project?.myRole) } : user),
+    [user, live.workspace, live.project?.myRole],
+  );
+  const switcherProjects: Project[] = live.enabled ? live.projects.map((p) => ({ id: p.id, name: p.status === "ARCHIVED" ? `${p.name} (archived)` : p.name, live: true })) : PROJECTS;
+  const switcherActive = live.enabled ? (live.project?.id ?? null) : projectId;
+  const liveAtRisk = live.summary?.overallSeverity === "HIGH" || live.summary?.overallSeverity === "CRITICAL";
+  const signInAction = { label: "Sign in", onClick: () => openAuth("signin") };
 
   return (
     <div className="flex min-h-screen bg-slate-50 font-sans text-slate-700 antialiased">
@@ -1680,7 +1800,7 @@ export default function PredictiveRiskManager() {
         active={activeNav}
         collapsed={collapsed}
         mobileOpen={mobileNavOpen}
-        user={user}
+        user={shownUser}
         onAccount={() => (user ? showView("profile") : openAuth("signin"))}
         onSelect={onNavigate}
         onToggleCollapsed={toggleCollapsed}
@@ -1689,14 +1809,17 @@ export default function PredictiveRiskManager() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <TopNav
-          projectId={projectId}
-          onProjectChange={setProjectId}
-          atRisk={current.buffer < 0}
+          projects={switcherProjects}
+          projectId={switcherActive}
+          projectsLoading={live.booting}
+          onProjectChange={live.enabled ? live.selectProject : setProjectId}
+          onCreateProject={live.workspace ? () => setCreatingProject(true) : undefined}
+          atRisk={live.enabled && live.project ? liveAtRisk : current.buffer < 0}
           onOpenCopilot={openCopilot}
           onOpenNav={() => setMobileNavOpen(true)}
           userMenu={
             <UserMenu
-              user={user}
+              user={shownUser}
               onSignIn={() => openAuth("signin")}
               onRegister={() => openAuth("register")}
               onViewProfile={() => showView("profile")}
@@ -1707,6 +1830,9 @@ export default function PredictiveRiskManager() {
         />
 
         <main className="mx-auto w-full max-w-7xl flex-1 space-y-6 px-4 py-8 sm:px-6 lg:px-8">
+          {notice && <Notice onDismiss={() => setNotice(null)}>{notice}</Notice>}
+          {live.enabled && live.error && !live.booting && <Notice>{live.error}</Notice>}
+
           {activeView === "dashboard" && (
             <>
               <section id="dashboard" className="scroll-mt-24 space-y-6">
@@ -1716,15 +1842,54 @@ export default function PredictiveRiskManager() {
                       {user ? `Good to see you, ${user.fullName.split(" ")[0]}` : "Risk forecast"}
                     </h1>
                     <p className="mt-1 text-sm text-slate-500">
-                      Deadline {formatDay(PLANNED_DEADLINE)} · {Object.keys(MEMBERS).length} members · {TASKS.length} dependent tasks · {HOURS_PER_DAY}h working days
+                      {live.enabled && live.project
+                        ? `${live.project.name} · Deadline ${fmtDate(live.project.deadline)} · ${live.members.length} members · ${live.tasks.length} tasks`
+                        : live.enabled
+                          ? live.workspace?.name ?? "Your workspace"
+                          : `Deadline ${formatDay(PLANNED_DEADLINE)} · ${Object.keys(MEMBERS).length} members · ${TASKS.length} dependent tasks · ${HOURS_PER_DAY}h working days`}
                     </p>
                   </div>
-                  <div className="flex -space-x-1.5">
-                    {Object.values(MEMBERS).map((m) => (
-                      <Avatar key={m.id} member={m} highlight={m.id === "anar" && !mitigated} />
-                    ))}
-                  </div>
+                  {!live.enabled && (
+                    <div className="flex -space-x-1.5">
+                      {Object.values(MEMBERS).map((m) => (
+                        <Avatar key={m.id} member={m} highlight={m.id === "anar" && !mitigated} />
+                      ))}
+                    </div>
+                  )}
                 </div>
+
+                {live.enabled &&
+                  (live.booting ? (
+                    <Card>
+                      <Loading label="Loading your workspace…" />
+                    </Card>
+                  ) : !live.workspace ? (
+                    <Card>
+                      <Empty title="You don't have a workspace yet" hint="Create one in Settings to start tracking projects.">
+                        <button type="button" onClick={() => showView("settings")} className={btnPrimary}>
+                          Open settings
+                        </button>
+                      </Empty>
+                    </Card>
+                  ) : !live.project ? (
+                    <Card>
+                      <Empty title="No projects in this workspace" hint="Create a project, add tasks, then run a risk analysis.">
+                        <button type="button" onClick={() => setCreatingProject(true)} className={btnPrimary}>
+                          + New project
+                        </button>
+                      </Empty>
+                    </Card>
+                  ) : (
+                    <LiveRiskPanel live={live} onOpenTasks={() => showView("tasks")} />
+                  ))}
+
+                {live.enabled && (
+                  <Notice tone="info">
+                    <span className="font-semibold text-slate-900">Illustrative forecast. </span>
+                    The metrics, dependency cascade and what-if simulator below run on built-in sample data ({PROJECTS[0].name}). The API has no forecast or simulation endpoints yet, so
+                    they do not reflect the project above.
+                  </Notice>
+                )}
 
                 <MetricGrid current={current} unmitigated={unmitigated} mitigatedForecast={withMock} mitigated={mitigated} />
               </section>
@@ -1746,32 +1911,40 @@ export default function PredictiveRiskManager() {
             </>
           )}
 
-          {activeView === "profile" && user && (
+          {activeView === "profile" && user && shownUser && (
             <ProfileView
               key={user.id}
-              user={user}
-              tasks={assignedTasksFor(user, current, mitigated)}
+              user={shownUser}
+              accountManaged={live.enabled}
+              tasks={live.enabled ? liveAssignedTasks(live, user.id) : assignedTasksFor(user, current, mitigated)}
               activity={activity}
               onSave={saveProfile}
               onBack={() => goToSection("dashboard")}
             />
           )}
 
-          {activeView === "workload" && (
-            <PlaceholderView
-              title="Team Workload"
-              description="Per-member capacity and the workload heatmap will live here. It isn't connected to this dashboard yet."
-              onBack={() => goToSection("dashboard")}
-            />
-          )}
+          {activeView === "tasks" &&
+            (live.enabled ? (
+              <TasksView live={live} meId={user?.id ?? null} />
+            ) : (
+              <PlaceholderView title="Tasks" description="Sign in to see, create and update the tasks of your projects." onBack={() => goToSection("dashboard")} action={signInAction} />
+            ))}
 
-          {activeView === "settings" && (
-            <PlaceholderView
-              title="Settings"
-              description="Workspace, notification and forecast-engine settings will live here. Nothing is configurable yet."
-              onBack={() => goToSection("dashboard")}
-            />
-          )}
+          {activeView === "inbox" && live.enabled && <InboxView live={live} />}
+
+          {activeView === "workload" &&
+            (live.enabled ? (
+              <WorkloadView live={live} />
+            ) : (
+              <PlaceholderView title="Team Workload" description="Sign in to see how open work is spread across your team." onBack={() => goToSection("dashboard")} action={signInAction} />
+            ))}
+
+          {activeView === "settings" &&
+            (live.enabled ? (
+              <SettingsView live={live} meId={user?.id ?? null} />
+            ) : (
+              <PlaceholderView title="Settings" description="Sign in to manage your workspace, projects and members." onBack={() => goToSection("dashboard")} action={signInAction} />
+            ))}
         </main>
       </div>
 
@@ -1784,6 +1957,18 @@ export default function PredictiveRiskManager() {
         onSimulate={simulateFromChat}
         inputRef={inputRef}
       />
+
+      {creatingProject && live.workspace && (
+        <CreateProjectModal
+          workspaceId={live.workspace.id}
+          onClose={() => setCreatingProject(false)}
+          onCreated={(created) => {
+            setCreatingProject(false);
+            void live.reloadProjects(created.id);
+            logActivity("plan", `Created project ${created.name}`);
+          }}
+        />
+      )}
 
       <AuthModal
         open={auth.open}
